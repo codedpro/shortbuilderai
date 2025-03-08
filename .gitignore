@@ -1,0 +1,12 @@
+downloads/*
+shorts/*
+templates/*
+voices/*
+cloudinary_credentials.json
+.env
+credentials.json
+instagram_credentials.json
+token.json
+*.mp4
+*.mp3
+__pycache__
