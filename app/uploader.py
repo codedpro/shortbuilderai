@@ -1,22 +1,104 @@
 import os
 import json
+from datetime import datetime, timedelta
+from dateutil import parser
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from app.logger import get_logger
+from datetime import datetime, timedelta, timezone
+from dateutil import parser
 import requests  # Needed for Instagram API calls
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 from urllib.parse import urlparse
 
+from app.logger import get_logger
+
 logger = get_logger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
-##############################
-# YouTube Upload Functions
-##############################
+#######################################################
+# INTERNAL Scheduling Logic for 2x Daily (10:00 & 18:00)
+#######################################################
+TIME_SLOTS_UTC = [10, 18]  # 10:00 and 18:00 UTC daily
+SCHEDULE_FILE = "youtube_schedule.json"
+
+def _load_schedule_data():
+    """
+    Loads a JSON file to track the last scheduled time.
+    Returns a dict: { "last_scheduled": "2025-04-03T10:00:00Z" } or None if missing.
+    """
+    if not os.path.exists(SCHEDULE_FILE):
+        return None
+    try:
+        with open(SCHEDULE_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error("Failed to read %s: %s", SCHEDULE_FILE, e)
+        return None
+
+def _save_schedule_data(data):
+    """
+    Saves scheduling info to youtube_schedule.json.
+    data is typically { "last_scheduled": ... }
+    """
+    try:
+        with open(SCHEDULE_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(e)
+
+TIME_SLOTS_UTC = [10, 18]  # 10:00 and 18:00 UTC daily
+SCHEDULE_FILE = "youtube_schedule.json"
+
+def _get_next_time_slot():
+    """
+    Computes the next available time slot (10:00 UTC or 18:00 UTC),
+    following the last_scheduled slot if it exists,
+    or from 'now' if there's no last_scheduled.
+
+    Returns an RFC 3339 string, e.g. "2025-04-03T10:00:00Z".
+    """
+    schedule_data = _load_schedule_data()
+    # Use an *aware* datetime in UTC:
+    now_utc = datetime.now(timezone.utc)
+
+    if schedule_data and "last_scheduled" in schedule_data:
+        last_str = schedule_data["last_scheduled"]
+        try:
+            last_dt = parser.isoparse(last_str)
+        except Exception:
+            logger.warning("Invalid last_scheduled format in %s, ignoring.", SCHEDULE_FILE)
+            last_dt = None
+    else:
+        last_dt = None
+
+    # Start from whichever is later: now or last scheduled time
+    if last_dt and last_dt > now_utc:
+        candidate = last_dt
+    else:
+        candidate = now_utc
+
+    # We want the NEXT slot after 'candidate'
+    while True:
+        candidate_date = candidate.date()
+        for hour in TIME_SLOTS_UTC:
+            # Also construct this slot time in UTC:
+            slot_dt = datetime(candidate_date.year, candidate_date.month, candidate_date.day,
+                               hour, 0, 0, tzinfo=timezone.utc)
+            if slot_dt > candidate:
+                return slot_dt.isoformat().replace("+00:00", "Z")
+        # If we didn't find a slot for that day, jump to next day at midnight UTC
+        candidate = datetime(candidate_date.year, candidate_date.month, candidate_date.day,
+                             tzinfo=timezone.utc) + timedelta(days=1)
+
+
+#################################################
+# YOUTUBE AUTH & UPLOAD (with hidden scheduling)
+#################################################
 
 def authenticate_youtube():
     creds = None
@@ -33,7 +115,12 @@ def authenticate_youtube():
     return build("youtube", "v3", credentials=creds)
 
 def upload_video(video_path, title="My YouTube Short", description="Auto-uploaded Shorts", tags=["shorts"], privacy="public"):
+    """
+    Uploads a video to YouTube. The call signature remains the same
+    but we automatically schedule it 2x per day (10:00 UTC, 18:00 UTC).
+    """
     try:
+        # --- Step 1: Load JSON metadata if present ---
         metadata_path = os.path.splitext(video_path)[0] + ".json"
         if os.path.exists(metadata_path):
             with open(metadata_path, "r") as meta_file:
@@ -45,12 +132,19 @@ def upload_video(video_path, title="My YouTube Short", description="Auto-uploade
         else:
             logger.info("No metadata file found; using default title, description, and tags.")
 
+        # --- Step 2: Authenticate with YouTube ---
         logger.info("Authenticating with YouTube API...")
         youtube = authenticate_youtube()
         if not youtube:
             logger.error("Authentication failed. Cannot upload video.")
             return None
 
+        # --- Step 3: Compute next time slot & override status for scheduling ---
+        publish_at = _get_next_time_slot()  # e.g. "2025-04-03T10:00:00Z"
+        logger.info("Scheduling video for next slot: %s", publish_at)
+
+        # Force privacy to 'private' for scheduling to work
+        # and set the publishAt field
         request_body = {
             "snippet": {
                 "title": title,
@@ -59,9 +153,12 @@ def upload_video(video_path, title="My YouTube Short", description="Auto-uploade
                 "categoryId": "22"
             },
             "status": {
-                "privacyStatus": privacy,
+                "privacyStatus": "private",
+                "publishAt": publish_at
             },
         }
+
+        # --- Step 4: Upload (insert) via API ---
         media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
         logger.info("Uploading video to YouTube: %s", video_path)
         request = youtube.videos().insert(
@@ -72,7 +169,12 @@ def upload_video(video_path, title="My YouTube Short", description="Auto-uploade
         response = request.execute()
         video_id = response.get("id")
         if video_id:
-            logger.info("YouTube video uploaded successfully! Video ID: %s", video_id)
+            logger.info("YouTube video scheduled! ID=%s | Goes public at: %s", video_id, publish_at)
+
+            # Save the chosen publish time as "last_scheduled" so the next call picks the following slot
+            schedule_data = {"last_scheduled": publish_at}
+            _save_schedule_data(schedule_data)
+
             return video_id
         else:
             logger.error("YouTube upload failed. No video ID returned.")
@@ -106,7 +208,6 @@ def upload_to_cloudinary(video_path):
             cloudinary_url_str = cloudinary_url_str.split("=", 1)[1]
         # Parse the Cloudinary URL to extract cloud_name, api_key, and api_secret
         parsed = urlparse(cloudinary_url_str)
-        # The expected format is: cloudinary://api_key:api_secret@cloud_name
         cloud_name = parsed.hostname
         api_key = parsed.username
         api_secret = parsed.password
@@ -227,9 +328,7 @@ def upload_instagram(video_path, caption="My Instagram Post"):
     NOTE: Instagram requires the video to be hosted at a public URL.
     This function first uploads the local video file to Cloudinary to obtain a public URL.
     It then uses that URL along with credentials stored in instagram_credentials.json to
-    create and publish an Instagram media container. If the long-lived token is missing,
-    expired, or invalid, it uses the temporary token to exchange for a new long-lived token
-    and updates the JSON file.
+    create and publish an Instagram media container.
     """
     try:
         metadata_path = os.path.splitext(video_path)[0] + ".json"

@@ -60,7 +60,7 @@ def get_video_stats(video_id):
     logger.info("Fetched stats for video %s: %s", video_id, stats)
     return stats
 
-def is_viral(stats, min_views=1000000, min_likes=150000, min_comments=5000):
+def is_viral(stats, min_views=1000000, min_likes=150000, min_comments=1000):
     """
     Determines whether a video is viral based on given thresholds.
     
